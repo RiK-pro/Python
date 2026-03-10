@@ -38,6 +38,35 @@ ok() { echo "OK: $*"; }
 info() { echo "-- $*"; }
 warn() { echo "WARN: $*"; }
 
+wait_for_apt_locks() {
+  local timeout="${1:-600}"
+  local waited=0
+  local interval=5
+
+  if ! command -v fuser >/dev/null 2>&1; then
+    warn "fuser is not available; skipping apt lock wait"
+    return 0
+  fi
+
+  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+    || fuser /var/lib/dpkg/lock >/dev/null 2>&1 \
+    || fuser /var/cache/apt/archives/lock >/dev/null 2>&1 \
+    || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    if (( waited == 0 )); then
+      warn "apt/dpkg is busy (likely unattended-upgrades), waiting for lock release..."
+    fi
+    if (( waited >= timeout )); then
+      die "apt/dpkg lock was not released in ${timeout}s"
+    fi
+    sleep "$interval"
+    waited=$((waited + interval))
+  done
+
+  if (( waited > 0 )); then
+    ok "apt/dpkg lock released after ${waited}s"
+  fi
+}
+
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
@@ -306,12 +335,16 @@ configure_bbr() {
 install_traffic_guard() {
   export DEBIAN_FRONTEND=noninteractive
 
+  wait_for_apt_locks 900
+
   if command -v debconf-set-selections >/dev/null 2>&1; then
     echo iptables-persistent iptables-persistent/autosave_v4 boolean false | debconf-set-selections || true
     echo iptables-persistent iptables-persistent/autosave_v6 boolean false | debconf-set-selections || true
   fi
 
+  wait_for_apt_locks 900
   apt-get update -y
+  wait_for_apt_locks 900
   apt-get install -y curl ipset iptables iptables-persistent rsyslog cron
 
   curl -fsSL https://raw.githubusercontent.com/dotX12/traffic-guard/master/install.sh | bash
@@ -329,7 +362,20 @@ netfilter-persistent save || true
 EOF2
 
   chmod 755 /usr/local/sbin/traffic-guard-apply.sh
-  /usr/local/sbin/traffic-guard-apply.sh
+  local apply_attempt=1
+  local max_attempts=5
+  while (( apply_attempt <= max_attempts )); do
+    wait_for_apt_locks 900
+    if /usr/local/sbin/traffic-guard-apply.sh; then
+      break
+    fi
+    if (( apply_attempt == max_attempts )); then
+      die "traffic-guard apply failed after ${max_attempts} attempts"
+    fi
+    warn "traffic-guard apply failed (attempt ${apply_attempt}/${max_attempts}), retrying in 10s..."
+    sleep 10
+    apply_attempt=$((apply_attempt + 1))
+  done
 
   cat > /etc/cron.d/traffic-guard-update <<'EOF2'
 17 3 * * * root /usr/local/sbin/traffic-guard-apply.sh >> /var/log/traffic-guard-update.log 2>&1
@@ -520,7 +566,7 @@ install_selfsteal() {
   is_int_1_11 "$template" || die "template must be 1..11 (got: $template)"
 
   if [[ -z "$port" ]]; then
-    prompt_default port "Selfsteal local tcp port [${DEFAULT_SELFSTEAL_PORT}]: " "$DEFAULT_SELFSTEAL_PORT"
+    port="$DEFAULT_SELFSTEAL_PORT"
   fi
   is_int "$port" || die "port must be numeric (got: $port)"
 
