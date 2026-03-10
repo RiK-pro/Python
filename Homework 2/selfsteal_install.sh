@@ -390,6 +390,7 @@ EOF2
 extract_inline_certs_from_active_config() {
   local helper_tag="$CERT_HELPER_TAG"
   local log_file="/tmp/remnanode-inline-cert-sync.log"
+  local container_ssl_dir="/var/lib/remnawave/configs/xray/ssl"
 
   if ! docker ps --format '{{.Names}}' | grep -qx "$REMNANODE_SERVICE_NAME"; then
     warn "container ${REMNANODE_SERVICE_NAME} is not running yet"
@@ -474,9 +475,29 @@ http.get({ socketPath, path: `/internal/get-config?token=${token}` }, (res) => {
 NODE
 EOSH
   then
-    ok "inline certificates synced into ${CERT_DIR}"
-    [[ -s "$DEFAULT_KEY_KEY" ]] || ln -sfn "$DEFAULT_KEY_PEM" "$DEFAULT_KEY_KEY" || true
-    return 0
+    mkdir -p "$CERT_DIR"
+
+    if ! docker cp "${REMNANODE_SERVICE_NAME}:${container_ssl_dir}/fullchain.pem" "$DEFAULT_CERT_FILE" 2>/dev/null; then
+      warn "inline sync: failed to copy fullchain.pem from container"
+      return 1
+    fi
+
+    if ! docker cp "${REMNANODE_SERVICE_NAME}:${container_ssl_dir}/privkey.pem" "$DEFAULT_KEY_PEM" 2>/dev/null; then
+      warn "inline sync: failed to copy privkey.pem from container"
+      return 1
+    fi
+
+    chmod 644 "$DEFAULT_CERT_FILE" 2>/dev/null || true
+    chmod 600 "$DEFAULT_KEY_PEM" 2>/dev/null || true
+    ln -sfn "$DEFAULT_KEY_PEM" "$DEFAULT_KEY_KEY" || true
+
+    if [[ -s "$DEFAULT_CERT_FILE" && ( -s "$DEFAULT_KEY_PEM" || -s "$DEFAULT_KEY_KEY" ) ]]; then
+      ok "inline certificates synced into ${CERT_DIR}"
+      return 0
+    fi
+
+    warn "inline sync: host certificate files are still missing in ${CERT_DIR}"
+    return 1
   fi
 
   warn "inline certificate sync failed ($(tail -n 1 "$log_file" 2>/dev/null || echo unknown))"
@@ -487,6 +508,8 @@ wait_for_node_certificates() {
   local cert_file="$DEFAULT_CERT_FILE"
   local key_file="$DEFAULT_KEY_PEM"
   local waited=0
+
+  mkdir -p "$CERT_DIR"
 
   if [[ -s "$DEFAULT_KEY_PEM" && ! -e "$DEFAULT_KEY_KEY" ]]; then
     ln -sfn "$DEFAULT_KEY_PEM" "$DEFAULT_KEY_KEY" || true
@@ -599,7 +622,7 @@ install_selfsteal() {
   ok "selfsteal installed"
 
   local l443=""
-  l443="$(ss -ltnp 2>/dev/null | grep -E ':443\\b' || true)"
+  l443="$(ss -H -ltnp '( sport = :443 )' 2>/dev/null || true)"
   if echo "$l443" | grep -q 'rw-core'; then
     ok "port 443 is owned by rw-core"
   else
