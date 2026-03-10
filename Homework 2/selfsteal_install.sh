@@ -10,6 +10,7 @@ DEFAULT_SELFSTEAL_PORT="${DEFAULT_SELFSTEAL_PORT:-9443}"
 DEFAULT_SELFSTEAL_TEMPLATE="${DEFAULT_SELFSTEAL_TEMPLATE:-1}"
 DEFAULT_SELFSTEAL_DOMAIN="${DEFAULT_SELFSTEAL_DOMAIN:-nld3.pink-service.ru}"
 CERT_WAIT_SECONDS="${CERT_WAIT_SECONDS:-600}"
+CERT_HELPER_TAG="${CERT_HELPER_TAG:-rw_cert_sync_helper}"
 
 CERT_DIR="$REMNANODE_DIR/xray-ssl"
 COMPOSE_FILE="$REMNANODE_DIR/docker-compose.yml"
@@ -26,6 +27,11 @@ NOTE_NODE=""
 NOTE_SELFSTEAL=""
 NOTE_OPTIMIZATION=""
 NOTE_SCANNER=""
+RUN_NODE=1
+RUN_SELFSTEAL=1
+RUN_OPTIMIZATION=1
+RUN_SCANNER=1
+INSTALL_MODE_NAME="full"
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "OK: $*"; }
@@ -68,6 +74,118 @@ is_int() {
 
 is_int_1_11() {
   [[ "${1:-}" =~ ^([1-9]|1[0-1])$ ]]
+}
+
+set_install_mode_flags() {
+  local mode="$1"
+  case "$mode" in
+    1)
+      RUN_NODE=1
+      RUN_SELFSTEAL=1
+      RUN_OPTIMIZATION=1
+      RUN_SCANNER=1
+      INSTALL_MODE_NAME="full"
+      ;;
+    2)
+      RUN_NODE=1
+      RUN_SELFSTEAL=0
+      RUN_OPTIMIZATION=0
+      RUN_SCANNER=0
+      INSTALL_MODE_NAME="remnanode_only"
+      ;;
+    3)
+      RUN_NODE=0
+      RUN_SELFSTEAL=1
+      RUN_OPTIMIZATION=0
+      RUN_SCANNER=0
+      INSTALL_MODE_NAME="selfsteal_only"
+      ;;
+    4)
+      RUN_NODE=1
+      RUN_SELFSTEAL=1
+      RUN_OPTIMIZATION=0
+      RUN_SCANNER=0
+      INSTALL_MODE_NAME="node_and_selfsteal"
+      ;;
+    5)
+      RUN_NODE=1
+      RUN_SELFSTEAL=0
+      RUN_OPTIMIZATION=1
+      RUN_SCANNER=1
+      INSTALL_MODE_NAME="node_opt_scanner"
+      ;;
+    6)
+      RUN_NODE=0
+      RUN_SELFSTEAL=0
+      RUN_OPTIMIZATION=1
+      RUN_SCANNER=1
+      INSTALL_MODE_NAME="opt_and_scanner_only"
+      ;;
+    7)
+      RUN_NODE=0
+      RUN_SELFSTEAL=0
+      RUN_OPTIMIZATION=1
+      RUN_SCANNER=0
+      INSTALL_MODE_NAME="optimization_only"
+      ;;
+    8)
+      RUN_NODE=0
+      RUN_SELFSTEAL=0
+      RUN_OPTIMIZATION=0
+      RUN_SCANNER=1
+      INSTALL_MODE_NAME="scanner_only"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+select_install_mode() {
+  local mode="${INSTALL_MODE:-}"
+  mode="$(trim "$mode")"
+
+  if [[ -z "$mode" ]]; then
+    echo
+    echo "Select installation mode:"
+    echo "  1) Full install (remnanode + selfsteal + optimization + scanner protection)"
+    echo "  2) Only remnanode"
+    echo "  3) Only selfsteal"
+    echo "  4) Remnanode + selfsteal"
+    echo "  5) Remnanode + optimization + scanner protection"
+    echo "  6) Only optimization + scanner protection"
+    echo "  7) Only optimization (BBR)"
+    echo "  8) Only scanner protection (traffic-guard)"
+    read -r -p "Mode [1]: " mode || true
+    mode="$(trim "$mode")"
+  fi
+
+  if [[ -z "$mode" ]]; then
+    mode="1"
+  fi
+
+  set_install_mode_flags "$mode" || die "invalid mode: $mode"
+  ok "selected mode: ${mode} (${INSTALL_MODE_NAME})"
+}
+
+mark_skipped_steps() {
+  if [[ "$RUN_NODE" -eq 0 ]]; then
+    STATUS_NODE="SKIPPED"
+    NOTE_NODE="not selected"
+  fi
+  if [[ "$RUN_SELFSTEAL" -eq 0 ]]; then
+    STATUS_SELFSTEAL="SKIPPED"
+    NOTE_SELFSTEAL="not selected"
+  fi
+  if [[ "$RUN_OPTIMIZATION" -eq 0 ]]; then
+    STATUS_OPTIMIZATION="SKIPPED"
+    NOTE_OPTIMIZATION="not selected"
+  fi
+  if [[ "$RUN_SCANNER" -eq 0 ]]; then
+    STATUS_SCANNER="SKIPPED"
+    NOTE_SCANNER="not selected"
+  fi
 }
 
 print_summary() {
@@ -126,6 +244,8 @@ services:
     image: ${REMNANODE_IMAGE}
     restart: always
     network_mode: host
+    cap_add:
+      - NET_ADMIN
     env_file:
       - .env
     environment:
@@ -221,6 +341,102 @@ EOF2
   ok "traffic-guard installed and cron enabled (daily at 03:17)"
 }
 
+extract_inline_certs_from_active_config() {
+  local helper_tag="$CERT_HELPER_TAG"
+  local log_file="/tmp/remnanode-inline-cert-sync.log"
+
+  if ! docker ps --format '{{.Names}}' | grep -qx "$REMNANODE_SERVICE_NAME"; then
+    warn "container ${REMNANODE_SERVICE_NAME} is not running yet"
+    return 1
+  fi
+
+  if docker exec -i -e CERT_TAG="$helper_tag" "$REMNANODE_SERVICE_NAME" sh >"$log_file" 2>&1 <<'EOSH'
+set -eu
+
+SOCK="$(tr '\0' '\n' </proc/1/environ | sed -n 's/^INTERNAL_SOCKET_PATH=//p' | head -n1)"
+TOK="$(tr '\0' '\n' </proc/1/environ | sed -n 's/^INTERNAL_REST_TOKEN=//p' | head -n1)"
+[ -n "$SOCK" ] && [ -n "$TOK" ] || { echo "NO_RUNTIME_ENV"; exit 11; }
+
+SOCK="$SOCK" TOK="$TOK" CERT_TAG="${CERT_TAG:-}" node <<'NODE'
+const fs = require('fs');
+const http = require('http');
+
+const socketPath = process.env.SOCK;
+const token = process.env.TOK;
+const certTag = (process.env.CERT_TAG || '').trim();
+const outDir = '/var/lib/remnawave/configs/xray/ssl';
+
+function fail(msg, code) {
+  console.error(msg);
+  process.exit(code);
+}
+
+function hasInlineCert(ib) {
+  const c = ib?.streamSettings?.tlsSettings?.certificates?.[0];
+  return Array.isArray(c?.certificate) &&
+    c.certificate.length > 0 &&
+    Array.isArray(c?.key) &&
+    c.key.length > 0;
+}
+
+http.get({ socketPath, path: `/internal/get-config?token=${token}` }, (res) => {
+  let raw = '';
+  res.on('data', (chunk) => {
+    raw += chunk;
+  });
+  res.on('end', () => {
+    let cfg;
+    try {
+      cfg = JSON.parse(raw || '{}');
+    } catch {
+      fail('BAD_CONFIG_JSON', 12);
+    }
+
+    const inbounds = Array.isArray(cfg?.inbounds) ? cfg.inbounds : [];
+
+    let inbound = null;
+    if (certTag) {
+      inbound = inbounds.find((ib) => ib?.tag === certTag && hasInlineCert(ib)) || null;
+    }
+    if (!inbound) {
+      inbound = inbounds.find((ib) => hasInlineCert(ib)) || null;
+    }
+    if (!inbound) {
+      fail('NO_INLINE_CERTS_IN_ACTIVE_CONFIG', 13);
+    }
+
+    const certObj = inbound.streamSettings.tlsSettings.certificates[0];
+    const certPem = `${certObj.certificate.join('\n')}\n`;
+    const keyPem = `${certObj.key.join('\n')}\n`;
+
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(`${outDir}/fullchain.pem`, certPem, { mode: 0o644 });
+    fs.writeFileSync(`${outDir}/privkey.pem`, keyPem, { mode: 0o600 });
+
+    try { fs.unlinkSync(`${outDir}/privkey.key`); } catch {}
+    try {
+      fs.symlinkSync(`${outDir}/privkey.pem`, `${outDir}/privkey.key`);
+    } catch {
+      fs.writeFileSync(`${outDir}/privkey.key`, keyPem, { mode: 0o600 });
+    }
+
+    console.log(`EXTRACTED_FROM_TAG=${inbound.tag}`);
+  });
+}).on('error', (err) => {
+  fail(`REQUEST_ERROR:${err.message}`, 14);
+});
+NODE
+EOSH
+  then
+    ok "inline certificates synced into ${CERT_DIR}"
+    [[ -s "$DEFAULT_KEY_KEY" ]] || ln -sfn "$DEFAULT_KEY_PEM" "$DEFAULT_KEY_KEY" || true
+    return 0
+  fi
+
+  warn "inline certificate sync failed ($(tail -n 1 "$log_file" 2>/dev/null || echo unknown))"
+  return 1
+}
+
 wait_for_node_certificates() {
   local cert_file="$DEFAULT_CERT_FILE"
   local key_file="$DEFAULT_KEY_PEM"
@@ -240,12 +456,21 @@ wait_for_node_certificates() {
       return 0
     fi
 
+    if (( waited % 10 == 0 )); then
+      extract_inline_certs_from_active_config || true
+      if [[ -s "$cert_file" && -s "$key_file" ]]; then
+        ok "certificates extracted from active node config"
+        return 0
+      fi
+    fi
+
     if [[ $waited -eq 0 ]]; then
       warn "certificates are not present yet"
       echo "Do this in panel now:"
       echo "1) Nodes -> Management -> open your node and finish creation"
-      echo "2) Select Config Profile and push/apply it to node"
-      echo "3) Ensure profile contains certificateFile/keyFile paths"
+      echo "2) Ensure inbound tag '${CERT_HELPER_TAG}' is included in node Active Inbounds"
+      echo "3) Push/apply profile and restart Xray on node"
+      echo "4) Ensure helper inbound has tlsSettings.certificates with certificateFile/keyFile paths"
       echo
       echo "Waiting up to ${CERT_WAIT_SECONDS}s for certs in $CERT_DIR ..."
     fi
@@ -355,77 +580,104 @@ install_selfsteal() {
 
 main() {
   require_root
-  need_cmd curl
+  select_install_mode
+  mark_skipped_steps
+
   need_cmd awk
   need_cmd sed
   need_cmd grep
-  need_cmd ss
 
-  STATUS_NODE="IN_PROGRESS"
-  install_docker_if_needed
+  if [[ "$RUN_NODE" -eq 1 || "$RUN_SELFSTEAL" -eq 1 || "$RUN_SCANNER" -eq 1 ]]; then
+    need_cmd curl
+  fi
+  if [[ "$RUN_SELFSTEAL" -eq 1 ]]; then
+    need_cmd ss
+  fi
 
-  local node_port="$DEFAULT_NODE_PORT"
-  is_int "$node_port" || die "node port must be numeric (got: $node_port)"
+  if [[ "$RUN_NODE" -eq 1 ]]; then
+    STATUS_NODE="IN_PROGRESS"
+    install_docker_if_needed
 
-  local secret_key="${REMNANODE_SECRET_KEY:-}"
-  secret_key="$(printf '%s' "$secret_key" | tr -d '\r\n')"
-  secret_key="$(trim "$secret_key")"
-  if [[ -z "$secret_key" ]]; then
-    prompt_default secret_key "Paste SECRET_KEY from panel: " ""
+    local node_port="$DEFAULT_NODE_PORT"
+    is_int "$node_port" || die "node port must be numeric (got: $node_port)"
+
+    local secret_key="${REMNANODE_SECRET_KEY:-}"
     secret_key="$(printf '%s' "$secret_key" | tr -d '\r\n')"
     secret_key="$(trim "$secret_key")"
-  fi
-  [[ -n "$secret_key" ]] || die "SECRET_KEY is required"
+    if [[ -z "$secret_key" ]]; then
+      prompt_default secret_key "Paste SECRET_KEY from panel: " ""
+      secret_key="$(printf '%s' "$secret_key" | tr -d '\r\n')"
+      secret_key="$(trim "$secret_key")"
+    fi
+    [[ -n "$secret_key" ]] || die "SECRET_KEY is required"
 
-  write_remnanode_files "$node_port" "$secret_key"
-  start_remnanode
-  STATUS_NODE="OK"
-  NOTE_NODE="compose up completed"
-
-  STATUS_OPTIMIZATION="IN_PROGRESS"
-  if configure_bbr; then
-    STATUS_OPTIMIZATION="OK"
-    NOTE_OPTIMIZATION="BBR enabled"
-  else
-    STATUS_OPTIMIZATION="FAIL"
-    NOTE_OPTIMIZATION="BBR configuration failed"
-    warn "BBR configuration failed"
+    write_remnanode_files "$node_port" "$secret_key"
+    start_remnanode
+    STATUS_NODE="OK"
+    NOTE_NODE="compose up completed"
   fi
 
-  STATUS_SCANNER="IN_PROGRESS"
-  if install_traffic_guard; then
-    STATUS_SCANNER="OK"
-    NOTE_SCANNER="traffic-guard active"
-  else
-    STATUS_SCANNER="FAIL"
-    NOTE_SCANNER="traffic-guard installation failed"
-    warn "traffic-guard installation failed"
+  if [[ "$RUN_OPTIMIZATION" -eq 1 ]]; then
+    STATUS_OPTIMIZATION="IN_PROGRESS"
+    if configure_bbr; then
+      STATUS_OPTIMIZATION="OK"
+      NOTE_OPTIMIZATION="BBR enabled"
+    else
+      STATUS_OPTIMIZATION="FAIL"
+      NOTE_OPTIMIZATION="BBR configuration failed"
+      warn "BBR configuration failed"
+    fi
   fi
 
-  STATUS_SELFSTEAL="IN_PROGRESS"
-  if ! wait_for_node_certificates; then
-    STATUS_SELFSTEAL="FAIL"
-    NOTE_SELFSTEAL="certificates not received from panel yet"
-    warn "continue with selfsteal only after certs appear in $CERT_DIR"
-    echo "Re-run this script later with:"
-    echo "  REMNANODE_DIR=$REMNANODE_DIR SELFSTEAL_DOMAIN=<domain> bash $0"
-    exit 2
+  if [[ "$RUN_SCANNER" -eq 1 ]]; then
+    STATUS_SCANNER="IN_PROGRESS"
+    if install_traffic_guard; then
+      STATUS_SCANNER="OK"
+      NOTE_SCANNER="traffic-guard active"
+    else
+      STATUS_SCANNER="FAIL"
+      NOTE_SCANNER="traffic-guard installation failed"
+      warn "traffic-guard installation failed"
+    fi
   fi
 
-  if install_selfsteal; then
-    STATUS_SELFSTEAL="OK"
-    NOTE_SELFSTEAL="installed and checked"
-  else
-    STATUS_SELFSTEAL="FAIL"
-    NOTE_SELFSTEAL="installation failed"
-    exit 2
+  if [[ "$RUN_SELFSTEAL" -eq 1 ]]; then
+    if [[ "$RUN_NODE" -eq 0 ]]; then
+      need_cmd docker
+      if ! docker ps --format '{{.Names}}' | grep -qx "$REMNANODE_SERVICE_NAME"; then
+        warn "container ${REMNANODE_SERVICE_NAME} is not running; cert extraction from runtime config may fail"
+      fi
+    fi
+
+    STATUS_SELFSTEAL="IN_PROGRESS"
+    if ! wait_for_node_certificates; then
+      STATUS_SELFSTEAL="FAIL"
+      NOTE_SELFSTEAL="certificates not received from panel yet"
+      warn "continue with selfsteal only after certs appear in $CERT_DIR"
+      echo "Re-run this script later with:"
+      echo "  REMNANODE_DIR=$REMNANODE_DIR SELFSTEAL_DOMAIN=<domain> bash $0"
+      exit 2
+    fi
+
+    if install_selfsteal; then
+      STATUS_SELFSTEAL="OK"
+      NOTE_SELFSTEAL="installed and checked"
+    else
+      STATUS_SELFSTEAL="FAIL"
+      NOTE_SELFSTEAL="installation failed"
+      exit 2
+    fi
   fi
 
   echo
   ok "completed"
-  echo "Node compose: $COMPOSE_FILE"
-  echo "Node env:     $ENV_FILE"
-  echo "Node cert dir:$CERT_DIR"
+  if [[ "$RUN_NODE" -eq 1 ]]; then
+    echo "Node compose: $COMPOSE_FILE"
+    echo "Node env:     $ENV_FILE"
+  fi
+  if [[ "$RUN_SELFSTEAL" -eq 1 || "$RUN_NODE" -eq 1 ]]; then
+    echo "Node cert dir:$CERT_DIR"
+  fi
 
   if [[ "$STATUS_OPTIMIZATION" == "FAIL" || "$STATUS_SCANNER" == "FAIL" ]]; then
     exit 3
