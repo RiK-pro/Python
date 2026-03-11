@@ -11,7 +11,8 @@ DEFAULT_SELFSTEAL_TEMPLATE="${DEFAULT_SELFSTEAL_TEMPLATE:-1}"
 DEFAULT_SELFSTEAL_DOMAIN="${DEFAULT_SELFSTEAL_DOMAIN:-nld3.pink-service.ru}"
 CERT_REQUIRED_DNS_PATTERN="${CERT_REQUIRED_DNS_PATTERN:-*.pink-service.ru}"
 CERT_WAIT_SECONDS="${CERT_WAIT_SECONDS:-600}"
-CERT_HELPER_TAG="${CERT_HELPER_TAG:-rw_cert_sync_helper}"
+CERT_HELPER_TAG="${CERT_HELPER_TAG:-}"
+CERT_HELPER_TAG_STRICT="${CERT_HELPER_TAG_STRICT:-0}"
 
 CERT_DIR="$REMNANODE_DIR/xray-ssl"
 COMPOSE_FILE="$REMNANODE_DIR/docker-compose.yml"
@@ -444,7 +445,10 @@ extract_inline_certs_from_active_config() {
     return 1
   fi
 
-  if docker exec -i -e CERT_TAG="$helper_tag" "$REMNANODE_SERVICE_NAME" sh >"$log_file" 2>&1 <<'EOSH'
+  if docker exec -i \
+    -e CERT_TAG="$helper_tag" \
+    -e CERT_TAG_STRICT="$CERT_HELPER_TAG_STRICT" \
+    "$REMNANODE_SERVICE_NAME" sh >"$log_file" 2>&1 <<'EOSH'
 set -eu
 
 SOCK="$(tr '\0' '\n' </proc/1/environ | sed -n 's/^INTERNAL_SOCKET_PATH=//p' | head -n1)"
@@ -458,6 +462,7 @@ const http = require('http');
 const socketPath = process.env.SOCK;
 const token = process.env.TOK;
 const certTag = (process.env.CERT_TAG || '').trim();
+const certTagStrict = (process.env.CERT_TAG_STRICT || '').trim() === '1';
 const outDir = '/var/lib/remnawave/configs/xray/ssl';
 
 function fail(msg, code) {
@@ -465,12 +470,24 @@ function fail(msg, code) {
   process.exit(code);
 }
 
+function getCertObj(ib) {
+  return ib?.streamSettings?.tlsSettings?.certificates?.[0] || null;
+}
+
 function hasInlineCert(ib) {
-  const c = ib?.streamSettings?.tlsSettings?.certificates?.[0];
+  const c = getCertObj(ib);
   return Array.isArray(c?.certificate) &&
     c.certificate.length > 0 &&
     Array.isArray(c?.key) &&
     c.key.length > 0;
+}
+
+function hasFileRefCert(ib) {
+  const c = getCertObj(ib);
+  return typeof c?.certificateFile === 'string' &&
+    c.certificateFile.trim().length > 0 &&
+    typeof c?.keyFile === 'string' &&
+    c.keyFile.trim().length > 0;
 }
 
 http.get({ socketPath, path: `/internal/get-config?token=${token}` }, (res) => {
@@ -488,25 +505,58 @@ http.get({ socketPath, path: `/internal/get-config?token=${token}` }, (res) => {
 
     const inbounds = Array.isArray(cfg?.inbounds) ? cfg.inbounds : [];
 
-    let inbound = null;
-    if (certTag) {
-      inbound = inbounds.find((ib) => ib?.tag === certTag && hasInlineCert(ib)) || null;
-      if (!inbound) {
-        const inlineTags = inbounds
-          .filter((ib) => hasInlineCert(ib))
-          .map((ib) => ib?.tag || '<no-tag>');
-        fail(`NO_INLINE_CERTS_FOR_TAG:${certTag};INLINE_TAGS:${inlineTags.join(',')}`, 13);
-      }
-    } else {
-      inbound = inbounds.find((ib) => hasInlineCert(ib)) || null;
-      if (!inbound) {
-        fail('NO_INLINE_CERTS_IN_ACTIVE_CONFIG', 13);
-      }
+    const fileRefInbounds = inbounds.filter((ib) => hasFileRefCert(ib));
+    const inlineInbounds = inbounds.filter((ib) => hasInlineCert(ib));
+    if (fileRefInbounds.length === 0 && inlineInbounds.length === 0) {
+      fail('NO_CERTS_IN_ACTIVE_CONFIG', 13);
     }
 
-    const certObj = inbound.streamSettings.tlsSettings.certificates[0];
-    const certPem = `${certObj.certificate.join('\n')}\n`;
-    const keyPem = `${certObj.key.join('\n')}\n`;
+    let inbound = null;
+    if (certTag) {
+      inbound = fileRefInbounds.find((ib) => ib?.tag === certTag) ||
+        inlineInbounds.find((ib) => ib?.tag === certTag) ||
+        null;
+      if (!inbound && certTagStrict) {
+        const fileTags = fileRefInbounds.map((ib) => ib?.tag || '<no-tag>');
+        const inlineTags = inlineInbounds.map((ib) => ib?.tag || '<no-tag>');
+        fail(`NO_CERTS_FOR_TAG:${certTag};FILE_TAGS:${fileTags.join(',')};INLINE_TAGS:${inlineTags.join(',')}`, 13);
+      }
+    }
+    if (!inbound) {
+      inbound = fileRefInbounds[0] || inlineInbounds[0];
+    }
+
+    const certObj = getCertObj(inbound);
+    if (!certObj) {
+      fail(`NO_CERT_OBJ_FOR_TAG:${inbound?.tag || '<no-tag>'}`, 14);
+    }
+
+    let certPem = '';
+    let keyPem = '';
+    let source = '';
+
+    if (hasFileRefCert(inbound)) {
+      source = 'file_refs';
+      const certFile = certObj.certificateFile.trim();
+      const keyFile = certObj.keyFile.trim();
+      try {
+        certPem = fs.readFileSync(certFile, 'utf8');
+        keyPem = fs.readFileSync(keyFile, 'utf8');
+      } catch (err) {
+        fail(`CERT_FILE_READ_ERROR:${err.message};CERT_FILE:${certFile};KEY_FILE:${keyFile}`, 15);
+      }
+      if (!certPem.trim() || !keyPem.trim()) {
+        fail(`CERT_FILE_EMPTY;CERT_FILE:${certFile};KEY_FILE:${keyFile}`, 16);
+      }
+      if (!certPem.endsWith('\n')) certPem += '\n';
+      if (!keyPem.endsWith('\n')) keyPem += '\n';
+    } else if (hasInlineCert(inbound)) {
+      source = 'inline_pem';
+      certPem = `${certObj.certificate.join('\n')}\n`;
+      keyPem = `${certObj.key.join('\n')}\n`;
+    } else {
+      fail(`NO_USABLE_CERT_DATA_FOR_TAG:${inbound?.tag || '<no-tag>'}`, 17);
+    }
 
     fs.mkdirSync(outDir, { recursive: true });
     fs.writeFileSync(`${outDir}/fullchain.pem`, certPem, { mode: 0o644 });
@@ -519,7 +569,9 @@ http.get({ socketPath, path: `/internal/get-config?token=${token}` }, (res) => {
       fs.writeFileSync(`${outDir}/privkey.key`, keyPem, { mode: 0o600 });
     }
 
-    console.log(`EXTRACTED_FROM_TAG=${inbound.tag}`);
+    const fileTags = fileRefInbounds.map((ib) => ib?.tag || '<no-tag>');
+    const inlineTags = inlineInbounds.map((ib) => ib?.tag || '<no-tag>');
+    console.log(`EXTRACTED_FROM_TAG=${inbound.tag || '<no-tag>'};SOURCE=${source};FILE_TAGS=${fileTags.join(',')};INLINE_TAGS=${inlineTags.join(',')}`);
   });
 }).on('error', (err) => {
   fail(`REQUEST_ERROR:${err.message}`, 14);
@@ -530,12 +582,12 @@ EOSH
     mkdir -p "$CERT_DIR"
 
     if ! docker cp "${REMNANODE_SERVICE_NAME}:${container_ssl_dir}/fullchain.pem" "$DEFAULT_CERT_FILE" 2>/dev/null; then
-      warn "inline sync: failed to copy fullchain.pem from container"
+      warn "runtime cert sync: failed to copy fullchain.pem from container"
       return 1
     fi
 
     if ! docker cp "${REMNANODE_SERVICE_NAME}:${container_ssl_dir}/privkey.pem" "$DEFAULT_KEY_PEM" 2>/dev/null; then
-      warn "inline sync: failed to copy privkey.pem from container"
+      warn "runtime cert sync: failed to copy privkey.pem from container"
       return 1
     fi
 
@@ -544,15 +596,15 @@ EOSH
     ln -sfn "$DEFAULT_KEY_PEM" "$DEFAULT_KEY_KEY" || true
 
     if [[ -s "$DEFAULT_CERT_FILE" && ( -s "$DEFAULT_KEY_PEM" || -s "$DEFAULT_KEY_KEY" ) ]]; then
-      ok "inline certificates synced into ${CERT_DIR}"
+      ok "runtime certificates synced into ${CERT_DIR}"
       return 0
     fi
 
-    warn "inline sync: host certificate files are still missing in ${CERT_DIR}"
+    warn "runtime cert sync: host certificate files are still missing in ${CERT_DIR}"
     return 1
   fi
 
-  warn "inline certificate sync failed ($(tail -n 1 "$log_file" 2>/dev/null || echo unknown))"
+  warn "runtime cert sync failed ($(tail -n 1 "$log_file" 2>/dev/null || echo unknown))"
   return 1
 }
 
@@ -589,9 +641,11 @@ wait_for_node_certificates() {
       warn "certificates are not present yet"
       echo "Do this in panel now:"
       echo "1) Nodes -> Management -> open your node and finish creation"
-      echo "2) Ensure inbound tag '${CERT_HELPER_TAG}' is included in node Active Inbounds"
-      echo "3) Push/apply profile and restart Xray on node"
-      echo "4) Ensure helper inbound has tlsSettings.certificates with certificateFile/keyFile paths"
+      echo "2) Push/apply profile and restart Xray on node"
+      echo "3) Ensure at least one Active Inbound has tlsSettings.certificates with certificateFile/keyFile paths"
+      if [[ -n "$CERT_HELPER_TAG" ]]; then
+        echo "4) Preferred cert tag is '${CERT_HELPER_TAG}' (set CERT_HELPER_TAG= to auto-pick first available cert source)"
+      fi
       echo
       echo "Waiting up to ${CERT_WAIT_SECONDS}s for certs in $CERT_DIR ..."
     fi
