@@ -8,7 +8,8 @@ REMNANODE_SERVICE_NAME="${REMNANODE_SERVICE_NAME:-remnanode}"
 DEFAULT_NODE_PORT="${DEFAULT_NODE_PORT:-2222}"
 DEFAULT_SELFSTEAL_PORT="${DEFAULT_SELFSTEAL_PORT:-9443}"
 DEFAULT_SELFSTEAL_TEMPLATE="${DEFAULT_SELFSTEAL_TEMPLATE:-1}"
-DEFAULT_SELFSTEAL_DOMAIN="${DEFAULT_SELFSTEAL_DOMAIN:-nld3.pink-service.ru}"
+DEFAULT_SELFSTEAL_DOMAIN="${DEFAULT_SELFSTEAL_DOMAIN:-your.domain.ru}"
+CERT_REQUIRED_DNS_PATTERN="${CERT_REQUIRED_DNS_PATTERN:-*.pink-service.ru}"
 CERT_WAIT_SECONDS="${CERT_WAIT_SECONDS:-600}"
 CERT_HELPER_TAG="${CERT_HELPER_TAG:-rw_cert_sync_helper}"
 
@@ -387,6 +388,52 @@ EOF2
   ok "traffic-guard installed and cron enabled (daily at 03:17)"
 }
 
+configure_ufw_smtp_protection() {
+  local ssh_port="22"
+  local ufw_out=""
+
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    ssh_port="$(printf '%s' "$SSH_CONNECTION" | awk '{print $4}')"
+  fi
+  if ! is_int "$ssh_port"; then
+    ssh_port="22"
+  fi
+
+  wait_for_apt_locks 900
+  apt-get update -y
+  wait_for_apt_locks 900
+  apt-get install -y ufw
+
+  ufw --force reset
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw allow 22/tcp
+  ufw allow 2222/tcp
+  ufw allow 48765/tcp
+  if [[ "$ssh_port" != "22" ]]; then
+    ufw allow "${ssh_port}/tcp"
+    ok "added current SSH server port rule: ${ssh_port}/tcp"
+  fi
+  ufw allow 443/tcp
+
+  ufw deny out 25/tcp || true
+  ufw route deny proto tcp to any port 25 || true
+
+  ufw --force enable
+  ufw reload
+
+  ufw_out="$(ufw status verbose || true)"
+  printf '%s\n' "$ufw_out" > /tmp/remnanode-ufw-status.log
+
+  echo "$ufw_out" | grep -q "Default: deny (incoming), allow (outgoing)" || return 1
+  echo "$ufw_out" | grep -Eq "22/tcp|OpenSSH" || return 1
+  echo "$ufw_out" | grep -q "443/tcp" || return 1
+  echo "$ufw_out" | grep -qE "25/tcp[[:space:]]+DENY OUT" || return 1
+  echo "$ufw_out" | grep -qE "25/tcp[[:space:]]+DENY FWD" || return 1
+
+  ok "ufw baseline + smtp protections applied"
+}
+
 extract_inline_certs_from_active_config() {
   local helper_tag="$CERT_HELPER_TAG"
   local log_file="/tmp/remnanode-inline-cert-sync.log"
@@ -567,12 +614,95 @@ pick_key_file() {
   return 1
 }
 
+hostname_matches_pattern() {
+  local host="${1,,}"
+  local pattern="${2,,}"
+  local suffix=""
+  local prefix=""
+
+  if [[ -z "$host" || -z "$pattern" ]]; then
+    return 1
+  fi
+
+  if [[ "$host" == "$pattern" ]]; then
+    return 0
+  fi
+
+  if [[ "$pattern" == \*.* ]]; then
+    suffix="${pattern#*.}"
+    if [[ "$host" == *".${suffix}" ]]; then
+      prefix="${host%.${suffix}}"
+      [[ "$prefix" != *.* ]] && return 0
+    fi
+  fi
+
+  return 1
+}
+
+cert_matches_domain() {
+  local cert_file="$1"
+  local domain="$2"
+  local san_raw=""
+  local san_entries=""
+  local dns_name=""
+  local cn=""
+
+  [[ -s "$cert_file" ]] || return 1
+
+  san_raw="$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null || true)"
+  san_entries="$(printf '%s\n' "$san_raw" | grep -oE 'DNS:[^, ]+' | sed 's/^DNS://')"
+  if [[ -n "$san_entries" ]]; then
+    while IFS= read -r dns_name; do
+      dns_name="$(trim "$dns_name")"
+      if hostname_matches_pattern "$domain" "$dns_name"; then
+        return 0
+      fi
+    done <<< "$san_entries"
+    return 1
+  fi
+
+  cn="$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed -n 's/.*CN[[:space:]]*=[[:space:]]*//p' | head -n1)"
+  cn="$(trim "$cn")"
+  hostname_matches_pattern "$domain" "$cn"
+}
+
+show_cert_brief() {
+  local cert_file="$1"
+  openssl x509 -in "$cert_file" -noout -subject -issuer -dates -ext subjectAltName 2>/dev/null || true
+}
+
+cert_contains_dns_pattern() {
+  local cert_file="$1"
+  local required_pattern="${2,,}"
+  local san_raw=""
+  local san_entries=""
+  local dns_name=""
+  local cn=""
+
+  [[ -s "$cert_file" ]] || return 1
+  [[ -n "$required_pattern" ]] || return 0
+
+  san_raw="$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null || true)"
+  san_entries="$(printf '%s\n' "$san_raw" | grep -oE 'DNS:[^, ]+' | sed 's/^DNS://')"
+  if [[ -n "$san_entries" ]]; then
+    while IFS= read -r dns_name; do
+      dns_name="$(trim "$dns_name")"
+      [[ "${dns_name,,}" == "$required_pattern" ]] && return 0
+    done <<< "$san_entries"
+  fi
+
+  cn="$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed -n 's/.*CN[[:space:]]*=[[:space:]]*//p' | head -n1)"
+  cn="$(trim "$cn")"
+  [[ "${cn,,}" == "$required_pattern" ]]
+}
+
 install_selfsteal() {
   local domain="${SELFSTEAL_DOMAIN:-}"
   local template="${SELFSTEAL_TEMPLATE:-}"
   local port="${SELFSTEAL_PORT:-}"
   local cert="${SELFSTEAL_SSL_CERT:-$DEFAULT_CERT_FILE}"
   local key="${SELFSTEAL_SSL_KEY:-}"
+  local installer_file=""
 
   domain="$(trim "$domain")"
   template="$(trim "$template")"
@@ -601,6 +731,26 @@ install_selfsteal() {
   [[ -s "$cert" ]] || die "certificate file not found or empty: $cert"
   [[ -s "$key" ]] || die "key file not found or empty: $key"
 
+  if ! cert_matches_domain "$cert" "$domain"; then
+    warn "certificate in $cert does not match domain ${domain}; trying runtime re-sync once"
+    if [[ "$cert" == "$DEFAULT_CERT_FILE" ]]; then
+      extract_inline_certs_from_active_config || true
+      [[ -z "$SELFSTEAL_SSL_KEY" ]] && key="$(pick_key_file || true)"
+    fi
+    if ! cert_matches_domain "$cert" "$domain"; then
+      echo "Current certificate details:"
+      show_cert_brief "$cert"
+      die "certificate does not cover ${domain}; update node certificate in panel and push profile"
+    fi
+    ok "certificate now matches ${domain}"
+  fi
+
+  if ! cert_contains_dns_pattern "$cert" "$CERT_REQUIRED_DNS_PATTERN"; then
+    echo "Current certificate details:"
+    show_cert_brief "$cert"
+    die "certificate must contain DNS name '${CERT_REQUIRED_DNS_PATTERN}'"
+  fi
+
   chmod 600 "$key" 2>/dev/null || true
 
   info "installing selfsteal with certs from remnanode mount"
@@ -610,7 +760,10 @@ install_selfsteal() {
   echo "  template: $template"
   echo "  port: 127.0.0.1:${port}"
 
-  bash <(curl -fsSL "$SELFSTEAL_SCRIPT_URL") @ \
+  installer_file="$(mktemp /tmp/selfsteal-installer.XXXXXX.sh)"
+  curl -fsSL "$SELFSTEAL_SCRIPT_URL" -o "$installer_file" || die "failed to download selfsteal installer from $SELFSTEAL_SCRIPT_URL"
+
+  bash "$installer_file" @ \
     --nginx --tcp --force \
     --domain "$domain" \
     --port "$port" \
@@ -618,6 +771,7 @@ install_selfsteal() {
     --ssl-key "$key" \
     --template "$template" \
     install
+  rm -f "$installer_file"
 
   ok "selfsteal installed"
 
@@ -700,13 +854,13 @@ main() {
 
   if [[ "$RUN_SCANNER" -eq 1 ]]; then
     STATUS_SCANNER="IN_PROGRESS"
-    if install_traffic_guard; then
+    if configure_ufw_smtp_protection && install_traffic_guard; then
       STATUS_SCANNER="OK"
-      NOTE_SCANNER="traffic-guard active"
+      NOTE_SCANNER="ufw + traffic-guard active"
     else
       STATUS_SCANNER="FAIL"
-      NOTE_SCANNER="traffic-guard installation failed"
-      warn "traffic-guard installation failed"
+      NOTE_SCANNER="ufw/traffic-guard setup failed"
+      warn "ufw or traffic-guard setup failed"
     fi
   fi
 
