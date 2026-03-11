@@ -490,6 +490,11 @@ function hasFileRefCert(ib) {
     c.keyFile.trim().length > 0;
 }
 
+function isApiInbound(ib) {
+  const tag = String(ib?.tag || '').toUpperCase();
+  return tag === 'REMNAWAVE_API_INBOUND' || tag.includes('API_INBOUND');
+}
+
 http.get({ socketPath, path: `/internal/get-config?token=${token}` }, (res) => {
   let raw = '';
   res.on('data', (chunk) => {
@@ -523,7 +528,9 @@ http.get({ socketPath, path: `/internal/get-config?token=${token}` }, (res) => {
       }
     }
     if (!inbound) {
-      inbound = fileRefInbounds[0] || inlineInbounds[0];
+      const preferredFileRefs = fileRefInbounds.filter((ib) => !isApiInbound(ib));
+      const preferredInline = inlineInbounds.filter((ib) => !isApiInbound(ib));
+      inbound = preferredFileRefs[0] || preferredInline[0] || fileRefInbounds[0] || inlineInbounds[0];
     }
 
     const certObj = getCertObj(inbound);
