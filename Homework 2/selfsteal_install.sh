@@ -491,12 +491,17 @@ http.get({ socketPath, path: `/internal/get-config?token=${token}` }, (res) => {
     let inbound = null;
     if (certTag) {
       inbound = inbounds.find((ib) => ib?.tag === certTag && hasInlineCert(ib)) || null;
-    }
-    if (!inbound) {
+      if (!inbound) {
+        const inlineTags = inbounds
+          .filter((ib) => hasInlineCert(ib))
+          .map((ib) => ib?.tag || '<no-tag>');
+        fail(`NO_INLINE_CERTS_FOR_TAG:${certTag};INLINE_TAGS:${inlineTags.join(',')}`, 13);
+      }
+    } else {
       inbound = inbounds.find((ib) => hasInlineCert(ib)) || null;
-    }
-    if (!inbound) {
-      fail('NO_INLINE_CERTS_IN_ACTIVE_CONFIG', 13);
+      if (!inbound) {
+        fail('NO_INLINE_CERTS_IN_ACTIVE_CONFIG', 13);
+      }
     }
 
     const certObj = inbound.streamSettings.tlsSettings.certificates[0];
