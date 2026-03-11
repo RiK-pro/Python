@@ -248,7 +248,35 @@ install_docker_if_needed() {
     ok "docker installed"
   fi
 
-  docker compose version >/dev/null 2>&1 || die "docker compose plugin is missing after docker install"
+  ensure_docker_compose_v2 || die "docker compose v2 is required"
+}
+
+ensure_docker_compose_v2() {
+  if docker compose version >/dev/null 2>&1; then
+    ok "docker compose v2 is available"
+    return 0
+  fi
+
+  warn "docker compose v2 is not available; attempting to install compose plugin"
+
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    wait_for_apt_locks 900
+    apt-get update -y || true
+    wait_for_apt_locks 900
+    if ! apt-get install -y docker-compose-plugin >/tmp/remnanode-compose-install.log 2>&1; then
+      apt-get install -y docker-compose-v2 >>/tmp/remnanode-compose-install.log 2>&1 || true
+    fi
+  fi
+
+  if docker compose version >/dev/null 2>&1; then
+    ok "docker compose v2 installed"
+    return 0
+  fi
+
+  warn "failed to install docker compose v2 automatically"
+  tail -n 20 /tmp/remnanode-compose-install.log 2>/dev/null || true
+  return 1
 }
 
 write_remnanode_files() {
@@ -769,6 +797,7 @@ install_selfsteal() {
   local cert="${SELFSTEAL_SSL_CERT:-$DEFAULT_CERT_FILE}"
   local key="${SELFSTEAL_SSL_KEY:-}"
   local installer_file=""
+  local installer_log=""
 
   domain="$(trim "$domain")"
   template="$(trim "$template")"
@@ -827,17 +856,31 @@ install_selfsteal() {
   echo "  port: 127.0.0.1:${port}"
 
   installer_file="$(mktemp /tmp/selfsteal-installer.XXXXXX.sh)"
+  installer_log="$(mktemp /tmp/selfsteal-install.XXXXXX.log)"
   curl -fsSL "$SELFSTEAL_SCRIPT_URL" -o "$installer_file" || die "failed to download selfsteal installer from $SELFSTEAL_SCRIPT_URL"
 
-  bash "$installer_file" @ \
+  if ! bash "$installer_file" @ \
     --nginx --tcp --force \
     --domain "$domain" \
     --port "$port" \
     --ssl-cert "$cert" \
     --ssl-key "$key" \
     --template "$template" \
-    install
+    install > >(tee "$installer_log") 2>&1; then
+    rm -f "$installer_file"
+    die "selfsteal installer failed (log: $installer_log)"
+  fi
   rm -f "$installer_file"
+
+  if grep -Eq "System requirements not met|Docker Compose V2 is still not available" "$installer_log"; then
+    die "selfsteal installer reported unmet requirements (log: $installer_log)"
+  fi
+
+  local l9443=""
+  l9443="$(ss -H -ltnp "( sport = :${port} )" 2>/dev/null || true)"
+  if ! echo "$l9443" | grep -Eq 'nginx|docker-proxy'; then
+    die "selfsteal endpoint 127.0.0.1:${port} is not listening after install"
+  fi
 
   ok "selfsteal installed"
 
@@ -931,8 +974,10 @@ main() {
   fi
 
   if [[ "$RUN_SELFSTEAL" -eq 1 ]]; then
+    need_cmd docker
+    ensure_docker_compose_v2 || die "docker compose v2 is required for selfsteal install"
+
     if [[ "$RUN_NODE" -eq 0 ]]; then
-      need_cmd docker
       if ! docker ps --format '{{.Names}}' | grep -qx "$REMNANODE_SERVICE_NAME"; then
         warn "container ${REMNANODE_SERVICE_NAME} is not running; cert extraction from runtime config may fail"
       fi
