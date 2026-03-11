@@ -8,7 +8,7 @@ REMNANODE_SERVICE_NAME="${REMNANODE_SERVICE_NAME:-remnanode}"
 DEFAULT_NODE_PORT="${DEFAULT_NODE_PORT:-2222}"
 DEFAULT_SELFSTEAL_PORT="${DEFAULT_SELFSTEAL_PORT:-9443}"
 DEFAULT_SELFSTEAL_TEMPLATE="${DEFAULT_SELFSTEAL_TEMPLATE:-1}"
-DEFAULT_SELFSTEAL_DOMAIN="${DEFAULT_SELFSTEAL_DOMAIN:-your.domain.ru}"
+DEFAULT_SELFSTEAL_DOMAIN="${DEFAULT_SELFSTEAL_DOMAIN:-nld3.pink-service.ru}"
 CERT_REQUIRED_DNS_PATTERN="${CERT_REQUIRED_DNS_PATTERN:-*.pink-service.ru}"
 CERT_WAIT_SECONDS="${CERT_WAIT_SECONDS:-600}"
 CERT_HELPER_TAG="${CERT_HELPER_TAG:-rw_cert_sync_helper}"
@@ -735,7 +735,7 @@ install_selfsteal() {
     warn "certificate in $cert does not match domain ${domain}; trying runtime re-sync once"
     if [[ "$cert" == "$DEFAULT_CERT_FILE" ]]; then
       extract_inline_certs_from_active_config || true
-      [[ -z "$SELFSTEAL_SSL_KEY" ]] && key="$(pick_key_file || true)"
+      [[ -z "${SELFSTEAL_SSL_KEY:-}" ]] && key="$(pick_key_file || true)"
     fi
     if ! cert_matches_domain "$cert" "$domain"; then
       echo "Current certificate details:"
