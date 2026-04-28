@@ -8,7 +8,9 @@ REMNANODE_SERVICE_NAME="${REMNANODE_SERVICE_NAME:-remnanode}"
 DEFAULT_NODE_PORT="${DEFAULT_NODE_PORT:-2222}"
 DEFAULT_SELFSTEAL_PORT="${DEFAULT_SELFSTEAL_PORT:-9443}"
 DEFAULT_SELFSTEAL_TEMPLATE="${DEFAULT_SELFSTEAL_TEMPLATE:-1}"
-DEFAULT_SELFSTEAL_DOMAIN="${DEFAULT_SELFSTEAL_DOMAIN:-nld3.pink-service.ru}"
+SELFSTEAL_BASE_DOMAIN="${SELFSTEAL_BASE_DOMAIN:-pink-service.ru}"
+DEFAULT_SELFSTEAL_SUBDOMAIN="${DEFAULT_SELFSTEAL_SUBDOMAIN:-nld3}"
+DEFAULT_SELFSTEAL_DOMAIN="${DEFAULT_SELFSTEAL_DOMAIN:-${DEFAULT_SELFSTEAL_SUBDOMAIN}.${SELFSTEAL_BASE_DOMAIN}}"
 CERT_REQUIRED_DNS_PATTERN="${CERT_REQUIRED_DNS_PATTERN:-*.pink-service.ru}"
 CERT_WAIT_SECONDS="${CERT_WAIT_SECONDS:-600}"
 CERT_HELPER_TAG="${CERT_HELPER_TAG:-}"
@@ -16,7 +18,6 @@ CERT_HELPER_TAG_STRICT="${CERT_HELPER_TAG_STRICT:-0}"
 
 CERT_DIR="$REMNANODE_DIR/xray-ssl"
 COMPOSE_FILE="$REMNANODE_DIR/docker-compose.yml"
-ENV_FILE="$REMNANODE_DIR/.env"
 DEFAULT_CERT_FILE="$CERT_DIR/fullchain.pem"
 DEFAULT_KEY_PEM="$CERT_DIR/privkey.pem"
 DEFAULT_KEY_KEY="$CERT_DIR/privkey.key"
@@ -97,6 +98,26 @@ prompt_default() {
     value="$default_value"
   fi
   printf -v "$var_name" '%s' "$value"
+}
+
+normalize_selfsteal_domain() {
+  local value
+  local base
+
+  value="$(trim "${1:-}")"
+  base="$(trim "${SELFSTEAL_BASE_DOMAIN:-}")"
+  base="${base#.}"
+
+  if [[ -z "$value" ]]; then
+    return 0
+  fi
+
+  if [[ "$value" != *.* && -n "$base" ]]; then
+    printf '%s.%s' "$value" "$base"
+    return 0
+  fi
+
+  printf '%s' "$value"
 }
 
 is_int() {
@@ -280,20 +301,15 @@ ensure_docker_compose_v2() {
 }
 
 write_remnanode_files() {
-  local node_port="$1"
-  local secret_key="$2"
+  local secret_key="$1"
+  local escaped_secret=""
 
   mkdir -p "$REMNANODE_DIR" "$CERT_DIR"
   chmod 700 "$CERT_DIR" || true
 
-  backup_if_exists "$ENV_FILE"
   backup_if_exists "$COMPOSE_FILE"
-
-  {
-    printf 'NODE_PORT=%s\n' "$node_port"
-    printf 'SECRET_KEY=%s\n' "$secret_key"
-  } > "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
+  escaped_secret="${secret_key//\\/\\\\}"
+  escaped_secret="${escaped_secret//\"/\\\"}"
 
   cat > "$COMPOSE_FILE" <<EOF2
 services:
@@ -305,17 +321,14 @@ services:
     network_mode: host
     cap_add:
       - NET_ADMIN
-    env_file:
-      - .env
     environment:
-      - NODE_PORT=\${NODE_PORT}
-      - SECRET_KEY=\${SECRET_KEY}
+      NODE_PORT: "${DEFAULT_NODE_PORT}"
+      SECRET_KEY: "${escaped_secret}"
     volumes:
       - ./xray-ssl:/var/lib/remnawave/configs/xray/ssl
 EOF2
 
   ok "written: $COMPOSE_FILE"
-  ok "written: $ENV_FILE"
 }
 
 start_remnanode() {
@@ -437,7 +450,7 @@ configure_ufw_smtp_protection() {
   ufw default deny incoming
   ufw default allow outgoing
   ufw allow 22/tcp
-  ufw allow 2222/tcp
+  ufw allow "${DEFAULT_NODE_PORT}/tcp"
   ufw allow 48765/tcp
   if [[ "$ssh_port" != "22" ]]; then
     ufw allow "${ssh_port}/tcp"
@@ -804,8 +817,9 @@ install_selfsteal() {
   port="$(trim "$port")"
 
   if [[ -z "$domain" ]]; then
-    prompt_default domain "Selfsteal domain (SNI/serverName) [${DEFAULT_SELFSTEAL_DOMAIN}]: " "$DEFAULT_SELFSTEAL_DOMAIN"
+    prompt_default domain "Selfsteal subdomain for ${SELFSTEAL_BASE_DOMAIN} [${DEFAULT_SELFSTEAL_SUBDOMAIN}]: " "$DEFAULT_SELFSTEAL_SUBDOMAIN"
   fi
+  domain="$(normalize_selfsteal_domain "$domain")"
   [[ -n "$domain" ]] || die "domain is required"
 
   if [[ -z "$template" ]]; then
@@ -877,9 +891,19 @@ install_selfsteal() {
   fi
 
   local l9443=""
-  l9443="$(ss -H -ltnp "( sport = :${port} )" 2>/dev/null || true)"
+  local wait_listen_seconds=30
+  local waited=0
+  while (( waited < wait_listen_seconds )); do
+    l9443="$(ss -H -ltnp "( sport = :${port} )" 2>/dev/null || true)"
+    if echo "$l9443" | grep -Eq 'nginx|docker-proxy'; then
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
   if ! echo "$l9443" | grep -Eq 'nginx|docker-proxy'; then
-    die "selfsteal endpoint 127.0.0.1:${port} is not listening after install"
+    selfsteal status >/tmp/selfsteal-status-after-install.log 2>&1 || true
+    die "selfsteal endpoint 127.0.0.1:${port} is not listening after install (status: /tmp/selfsteal-status-after-install.log, installer log: $installer_log)"
   fi
 
   ok "selfsteal installed"
@@ -930,9 +954,6 @@ main() {
     STATUS_NODE="IN_PROGRESS"
     install_docker_if_needed
 
-    local node_port="$DEFAULT_NODE_PORT"
-    is_int "$node_port" || die "node port must be numeric (got: $node_port)"
-
     local secret_key="${REMNANODE_SECRET_KEY:-}"
     secret_key="$(printf '%s' "$secret_key" | tr -d '\r\n')"
     secret_key="$(trim "$secret_key")"
@@ -943,7 +964,7 @@ main() {
     fi
     [[ -n "$secret_key" ]] || die "SECRET_KEY is required"
 
-    write_remnanode_files "$node_port" "$secret_key"
+    write_remnanode_files "$secret_key"
     start_remnanode
     STATUS_NODE="OK"
     NOTE_NODE="compose up completed"
@@ -989,7 +1010,7 @@ main() {
       NOTE_SELFSTEAL="certificates not received from panel yet"
       warn "continue with selfsteal only after certs appear in $CERT_DIR"
       echo "Re-run this script later with:"
-      echo "  REMNANODE_DIR=$REMNANODE_DIR SELFSTEAL_DOMAIN=<domain> bash $0"
+      echo "  REMNANODE_DIR=$REMNANODE_DIR SELFSTEAL_DOMAIN=<subdomain-or-domain> bash $0"
       exit 2
     fi
 
@@ -1007,7 +1028,6 @@ main() {
   ok "completed"
   if [[ "$RUN_NODE" -eq 1 ]]; then
     echo "Node compose: $COMPOSE_FILE"
-    echo "Node env:     $ENV_FILE"
   fi
   if [[ "$RUN_SELFSTEAL" -eq 1 || "$RUN_NODE" -eq 1 ]]; then
     echo "Node cert dir:$CERT_DIR"
