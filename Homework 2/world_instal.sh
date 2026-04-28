@@ -8,7 +8,9 @@ REMNANODE_SERVICE_NAME="${REMNANODE_SERVICE_NAME:-remnanode}"
 DEFAULT_NODE_PORT="${DEFAULT_NODE_PORT:-2222}"
 DEFAULT_SELFSTEAL_PORT="${DEFAULT_SELFSTEAL_PORT:-9443}"
 DEFAULT_SELFSTEAL_TEMPLATE="${DEFAULT_SELFSTEAL_TEMPLATE:-1}"
-DEFAULT_SELFSTEAL_DOMAIN="${DEFAULT_SELFSTEAL_DOMAIN:-nld.pink-world.ru}"
+SELFSTEAL_BASE_DOMAIN="${SELFSTEAL_BASE_DOMAIN:-pink-world.ru}"
+DEFAULT_SELFSTEAL_SUBDOMAIN="${DEFAULT_SELFSTEAL_SUBDOMAIN:-nld}"
+DEFAULT_SELFSTEAL_DOMAIN="${DEFAULT_SELFSTEAL_DOMAIN:-${DEFAULT_SELFSTEAL_SUBDOMAIN}.${SELFSTEAL_BASE_DOMAIN}}"
 CERT_REQUIRED_DNS_PATTERN="${CERT_REQUIRED_DNS_PATTERN:-*.pink-world.ru}"
 CERT_WAIT_SECONDS="${CERT_WAIT_SECONDS:-600}"
 CERT_HELPER_TAG="${CERT_HELPER_TAG:-}"
@@ -96,6 +98,26 @@ prompt_default() {
     value="$default_value"
   fi
   printf -v "$var_name" '%s' "$value"
+}
+
+normalize_selfsteal_domain() {
+  local value
+  local base
+
+  value="$(trim "${1:-}")"
+  base="$(trim "${SELFSTEAL_BASE_DOMAIN:-}")"
+  base="${base#.}"
+
+  if [[ -z "$value" ]]; then
+    return 0
+  fi
+
+  if [[ "$value" != *.* && -n "$base" ]]; then
+    printf '%s.%s' "$value" "$base"
+    return 0
+  fi
+
+  printf '%s' "$value"
 }
 
 is_int() {
@@ -795,8 +817,9 @@ install_selfsteal() {
   port="$(trim "$port")"
 
   if [[ -z "$domain" ]]; then
-    prompt_default domain "Selfsteal domain (SNI/serverName) [${DEFAULT_SELFSTEAL_DOMAIN}]: " "$DEFAULT_SELFSTEAL_DOMAIN"
+    prompt_default domain "Selfsteal subdomain for ${SELFSTEAL_BASE_DOMAIN} [${DEFAULT_SELFSTEAL_SUBDOMAIN}]: " "$DEFAULT_SELFSTEAL_SUBDOMAIN"
   fi
+  domain="$(normalize_selfsteal_domain "$domain")"
   [[ -n "$domain" ]] || die "domain is required"
 
   if [[ -z "$template" ]]; then
@@ -987,7 +1010,7 @@ main() {
       NOTE_SELFSTEAL="certificates not received from panel yet"
       warn "continue with selfsteal only after certs appear in $CERT_DIR"
       echo "Re-run this script later with:"
-      echo "  REMNANODE_DIR=$REMNANODE_DIR SELFSTEAL_DOMAIN=<domain> bash $0"
+      echo "  REMNANODE_DIR=$REMNANODE_DIR SELFSTEAL_DOMAIN=<subdomain-or-domain> bash $0"
       exit 2
     fi
 
