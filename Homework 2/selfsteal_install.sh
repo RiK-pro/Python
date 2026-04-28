@@ -120,6 +120,123 @@ normalize_selfsteal_domain() {
   printf '%s' "$value"
 }
 
+selfsteal_domain_prompt_value() {
+  local domain
+  local base
+  local suffix
+  local subdomain
+
+  domain="$(normalize_selfsteal_domain "${1:-}")"
+  base="$(trim "${SELFSTEAL_BASE_DOMAIN:-}")"
+  base="${base#.}"
+  suffix=".${base}"
+
+  if [[ -n "$base" && "$domain" == *"$suffix" ]]; then
+    subdomain="${domain%"$suffix"}"
+    if [[ -n "$subdomain" && "$subdomain" != *.* ]]; then
+      printf '%s' "$subdomain"
+      return 0
+    fi
+  fi
+
+  printf '%s' "$domain"
+}
+
+detect_selfsteal_domain_from_active_config() {
+  local log_file="/tmp/remnanode-servername-detect.log"
+  local detected=""
+
+  if ! docker ps --format '{{.Names}}' | grep -qx "$REMNANODE_SERVICE_NAME"; then
+    return 1
+  fi
+
+  if ! detected="$(docker exec -i \
+    -e BASE_DOMAIN="$SELFSTEAL_BASE_DOMAIN" \
+    -e CERT_TAG="$CERT_HELPER_TAG" \
+    -e CERT_TAG_STRICT="$CERT_HELPER_TAG_STRICT" \
+    "$REMNANODE_SERVICE_NAME" sh 2>"$log_file" <<'EOSH'
+set -eu
+
+SOCK="$(tr '\0' '\n' </proc/1/environ | sed -n 's/^INTERNAL_SOCKET_PATH=//p' | head -n1)"
+TOK="$(tr '\0' '\n' </proc/1/environ | sed -n 's/^INTERNAL_REST_TOKEN=//p' | head -n1)"
+[ -n "$SOCK" ] && [ -n "$TOK" ] || exit 11
+
+SOCK="$SOCK" TOK="$TOK" BASE_DOMAIN="${BASE_DOMAIN:-}" CERT_TAG="${CERT_TAG:-}" CERT_TAG_STRICT="${CERT_TAG_STRICT:-0}" node <<'NODE'
+const http = require('http');
+
+const socketPath = process.env.SOCK;
+const token = process.env.TOK;
+const baseDomain = (process.env.BASE_DOMAIN || '').trim().toLowerCase().replace(/^\./, '');
+const certTag = (process.env.CERT_TAG || '').trim();
+const certTagStrict = (process.env.CERT_TAG_STRICT || '').trim() === '1';
+
+function isApiInbound(ib) {
+  const tag = String(ib?.tag || '').toUpperCase();
+  return tag === 'REMNAWAVE_API_INBOUND' || tag.includes('API_INBOUND');
+}
+
+function isBaseDomainMatch(name) {
+  const lower = name.toLowerCase();
+  return baseDomain && (lower === baseDomain || lower.endsWith(`.${baseDomain}`));
+}
+
+http.get({ socketPath, path: `/internal/get-config?token=${token}` }, (res) => {
+  let raw = '';
+  res.on('data', (chunk) => {
+    raw += chunk;
+  });
+  res.on('end', () => {
+    let cfg;
+    try {
+      cfg = JSON.parse(raw || '{}');
+    } catch {
+      process.exit(12);
+    }
+
+    const inbounds = Array.isArray(cfg?.inbounds) ? cfg.inbounds : [];
+    const candidates = [];
+
+    inbounds.forEach((ib, inboundIndex) => {
+      if (certTagStrict && certTag && ib?.tag !== certTag) return;
+
+      const names = ib?.streamSettings?.realitySettings?.serverNames;
+      if (!Array.isArray(names)) return;
+
+      names.forEach((rawName, nameIndex) => {
+        const name = String(rawName || '').trim();
+        if (!name || name.includes('*')) return;
+
+        let score = 0;
+        if (certTag && ib?.tag === certTag) score += 1000;
+        if (!isApiInbound(ib)) score += 100;
+        if (isBaseDomainMatch(name)) score += 50;
+        if (Number(ib?.port) === 443) score += 10;
+
+        candidates.push({ name, score, order: inboundIndex * 1000 + nameIndex });
+      });
+    });
+
+    if (candidates.length === 0) {
+      process.exit(13);
+    }
+
+    candidates.sort((a, b) => b.score - a.score || a.order - b.order);
+    process.stdout.write(candidates[0].name);
+  });
+}).on('error', () => {
+  process.exit(14);
+});
+NODE
+EOSH
+  )"; then
+    return 1
+  fi
+
+  detected="$(trim "$detected")"
+  [[ -n "$detected" ]] || return 1
+  printf '%s' "$detected"
+}
+
 is_int() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
@@ -811,13 +928,21 @@ install_selfsteal() {
   local key="${SELFSTEAL_SSL_KEY:-}"
   local installer_file=""
   local installer_log=""
+  local detected_domain=""
+  local prompt_value=""
 
   domain="$(trim "$domain")"
   template="$(trim "$template")"
   port="$(trim "$port")"
 
   if [[ -z "$domain" ]]; then
-    prompt_default domain "Selfsteal subdomain for ${SELFSTEAL_BASE_DOMAIN} [${DEFAULT_SELFSTEAL_SUBDOMAIN}]: " "$DEFAULT_SELFSTEAL_SUBDOMAIN"
+    detected_domain="$(detect_selfsteal_domain_from_active_config || true)"
+    if [[ -n "$detected_domain" ]]; then
+      prompt_value="$(selfsteal_domain_prompt_value "$detected_domain")"
+      prompt_default domain "Detected serverName ${detected_domain}. Selfsteal subdomain/domain [${prompt_value}]: " "$prompt_value"
+    else
+      prompt_default domain "Selfsteal subdomain for ${SELFSTEAL_BASE_DOMAIN} [${DEFAULT_SELFSTEAL_SUBDOMAIN}]: " "$DEFAULT_SELFSTEAL_SUBDOMAIN"
+    fi
   fi
   domain="$(normalize_selfsteal_domain "$domain")"
   [[ -n "$domain" ]] || die "domain is required"
