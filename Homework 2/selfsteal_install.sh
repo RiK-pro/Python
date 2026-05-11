@@ -15,6 +15,12 @@ CERT_REQUIRED_DNS_PATTERN="${CERT_REQUIRED_DNS_PATTERN:-*.pink-service.ru}"
 CERT_WAIT_SECONDS="${CERT_WAIT_SECONDS:-600}"
 CERT_HELPER_TAG="${CERT_HELPER_TAG:-}"
 CERT_HELPER_TAG_STRICT="${CERT_HELPER_TAG_STRICT:-0}"
+CERT_SYNC_ENABLED="${CERT_SYNC_ENABLED:-1}"
+CERT_SYNC_TIMER_ENABLED="${CERT_SYNC_TIMER_ENABLED:-1}"
+CERT_SYNC_ON_CALENDAR="${CERT_SYNC_ON_CALENDAR:-*-*-* 04:17:00}"
+CERT_SYNC_RANDOMIZED_DELAY_SECONDS="${CERT_SYNC_RANDOMIZED_DELAY_SECONDS:-3600}"
+SELFSTEAL_NGINX_SERVICE_NAME="${SELFSTEAL_NGINX_SERVICE_NAME:-nginx-selfsteal}"
+SELFSTEAL_NGINX_SSL_DIR="${SELFSTEAL_NGINX_SSL_DIR:-/opt/nginx-selfsteal/ssl}"
 
 CERT_DIR="$REMNANODE_DIR/xray-ssl"
 COMPOSE_FILE="$REMNANODE_DIR/docker-compose.yml"
@@ -34,6 +40,7 @@ RUN_NODE=1
 RUN_SELFSTEAL=1
 RUN_OPTIMIZATION=1
 RUN_SCANNER=1
+RUN_CERT_SYNC=0
 INSTALL_MODE_NAME="full"
 
 die() { echo "FAIL: $*" >&2; exit 1; }
@@ -304,6 +311,14 @@ set_install_mode_flags() {
       RUN_SCANNER=1
       INSTALL_MODE_NAME="scanner_only"
       ;;
+    9)
+      RUN_NODE=0
+      RUN_SELFSTEAL=0
+      RUN_OPTIMIZATION=0
+      RUN_SCANNER=0
+      RUN_CERT_SYNC=1
+      INSTALL_MODE_NAME="cert_sync_only"
+      ;;
     *)
       return 1
       ;;
@@ -326,6 +341,7 @@ select_install_mode() {
     echo "  6) Only optimization + scanner protection"
     echo "  7) Only optimization (BBR)"
     echo "  8) Only scanner protection (traffic-guard)"
+    echo "  9) Only selfsteal cert sync timer"
     read -r -p "Mode [1]: " mode || true
     mode="$(trim "$mode")"
   fi
@@ -920,6 +936,303 @@ cert_contains_dns_pattern() {
   [[ "${cn,,}" == "$required_pattern" ]]
 }
 
+install_selfsteal_cert_sync() {
+  local sync_script="/usr/local/bin/remnanode-selfsteal-cert-sync"
+  local service_file="/etc/systemd/system/remnanode-selfsteal-cert-sync.service"
+  local timer_file="/etc/systemd/system/remnanode-selfsteal-cert-sync.timer"
+
+  if [[ "${CERT_SYNC_ENABLED:-1}" != "1" ]]; then
+    warn "selfsteal cert sync is disabled (CERT_SYNC_ENABLED=${CERT_SYNC_ENABLED})"
+    return 0
+  fi
+
+  cat > "$sync_script" <<'SYNC_SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+REMNANODE_SERVICE_NAME="${REMNANODE_SERVICE_NAME:-__REMNANODE_SERVICE_NAME__}"
+SELFSTEAL_NGINX_SERVICE_NAME="${SELFSTEAL_NGINX_SERVICE_NAME:-__SELFSTEAL_NGINX_SERVICE_NAME__}"
+SELFSTEAL_BASE_DOMAIN="${SELFSTEAL_BASE_DOMAIN:-__SELFSTEAL_BASE_DOMAIN__}"
+CERT_HELPER_TAG="${CERT_HELPER_TAG:-__CERT_HELPER_TAG__}"
+CERT_HELPER_TAG_STRICT="${CERT_HELPER_TAG_STRICT:-__CERT_HELPER_TAG_STRICT__}"
+REMNANODE_CERT_DIR="${REMNANODE_CERT_DIR:-__REMNANODE_CERT_DIR__}"
+SELFSTEAL_NGINX_SSL_DIR="${SELFSTEAL_NGINX_SSL_DIR:-__SELFSTEAL_NGINX_SSL_DIR__}"
+LOCK_FILE="\${LOCK_FILE:-/run/remnanode-selfsteal-cert-sync.lock}"
+
+log() { echo "[cert-sync] \$*"; }
+warn() { echo "[cert-sync] WARN: \$*" >&2; }
+die() { echo "[cert-sync] FAIL: \$*" >&2; exit 1; }
+
+fingerprint() {
+  local cert_file="\$1"
+  [[ -s "\$cert_file" ]] || return 1
+  openssl x509 -in "\$cert_file" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2
+}
+
+command -v docker >/dev/null 2>&1 || die "docker is required"
+command -v openssl >/dev/null 2>&1 || die "openssl is required"
+command -v flock >/dev/null 2>&1 || die "flock is required"
+
+exec 9>"\$LOCK_FILE"
+flock -n 9 || { log "another sync is running"; exit 0; }
+
+tmp_dir="\$(mktemp -d)"
+trap 'rm -rf "\$tmp_dir"' EXIT
+
+docker ps --format '{{.Names}}' | grep -qx "\$REMNANODE_SERVICE_NAME" || die "container \$REMNANODE_SERVICE_NAME is not running"
+
+docker exec -i \
+  -e BASE_DOMAIN="\$SELFSTEAL_BASE_DOMAIN" \
+  -e CERT_TAG="\$CERT_HELPER_TAG" \
+  -e CERT_TAG_STRICT="\$CERT_HELPER_TAG_STRICT" \
+  "\$REMNANODE_SERVICE_NAME" sh <<'EOSH'
+set -eu
+
+SOCK="$(tr '\0' '\n' </proc/1/environ | sed -n 's/^INTERNAL_SOCKET_PATH=//p' | head -n1)"
+TOK="$(tr '\0' '\n' </proc/1/environ | sed -n 's/^INTERNAL_REST_TOKEN=//p' | head -n1)"
+[ -n "$SOCK" ] && [ -n "$TOK" ] || { echo "NO_RUNTIME_ENV" >&2; exit 11; }
+
+SOCK="$SOCK" TOK="$TOK" BASE_DOMAIN="${BASE_DOMAIN:-}" CERT_TAG="${CERT_TAG:-}" CERT_TAG_STRICT="${CERT_TAG_STRICT:-0}" node <<'NODE'
+const fs = require('fs');
+const http = require('http');
+
+const socketPath = process.env.SOCK;
+const token = process.env.TOK;
+const baseDomain = (process.env.BASE_DOMAIN || '').trim().toLowerCase().replace(/^\./, '');
+const certTag = (process.env.CERT_TAG || '').trim();
+const certTagStrict = (process.env.CERT_TAG_STRICT || '').trim() === '1';
+
+function fail(message, code) {
+  console.error(message);
+  process.exit(code);
+}
+
+function getCertObj(ib) {
+  return ib?.streamSettings?.tlsSettings?.certificates?.[0] || null;
+}
+
+function hasInlineCert(ib) {
+  const c = getCertObj(ib);
+  return Array.isArray(c?.certificate) && c.certificate.length > 0 &&
+    Array.isArray(c?.key) && c.key.length > 0;
+}
+
+function hasFileRefCert(ib) {
+  const c = getCertObj(ib);
+  return typeof c?.certificateFile === 'string' && c.certificateFile.trim().length > 0 &&
+    typeof c?.keyFile === 'string' && c.keyFile.trim().length > 0;
+}
+
+function isApiInbound(ib) {
+  const tag = String(ib?.tag || '').toUpperCase();
+  return tag === 'REMNAWAVE_API_INBOUND' || tag.includes('API_INBOUND');
+}
+
+function baseDomainMatch(name) {
+  const lower = String(name || '').trim().toLowerCase();
+  return baseDomain && (lower === baseDomain || lower.endsWith(`.${baseDomain}`));
+}
+
+function scoreInbound(ib, order) {
+  if (!hasInlineCert(ib) && !hasFileRefCert(ib)) return -1;
+  if (isApiInbound(ib)) return -1;
+  if (certTagStrict && certTag && ib?.tag !== certTag) return -1;
+
+  const tag = String(ib?.tag || '').toLowerCase();
+  const names = Array.isArray(ib?.streamSettings?.realitySettings?.serverNames)
+    ? ib.streamSettings.realitySettings.serverNames
+    : [];
+
+  let score = 0;
+  if (certTag && ib?.tag === certTag) score += 10000;
+  if (tag.includes('selfsteal') || tag.includes('selfstealer')) score += 1000;
+  if (Number(ib?.port) === 443) score += 500;
+  if (names.some(baseDomainMatch)) score += 300;
+  if (hasFileRefCert(ib)) score += 20;
+  if (hasInlineCert(ib)) score += 10;
+  return score * 100000 - order;
+}
+
+http.get({ socketPath, path: `/internal/get-config?token=${encodeURIComponent(token)}` }, (res) => {
+  let raw = '';
+  res.on('data', (chunk) => {
+    raw += chunk;
+  });
+  res.on('end', () => {
+    let cfg;
+    try {
+      cfg = JSON.parse(raw || '{}');
+    } catch {
+      fail(`BAD_CONFIG_JSON:${raw.slice(0, 80).replace(/\n/g, ' ')}`, 12);
+    }
+
+    const inbounds = Array.isArray(cfg?.inbounds) ? cfg.inbounds : [];
+    const candidates = inbounds
+      .map((ib, order) => ({ ib, score: scoreInbound(ib, order) }))
+      .filter((candidate) => candidate.score >= 0)
+      .sort((a, b) => b.score - a.score);
+
+    if (candidates.length === 0) {
+      fail('NO_SELFSTEAL_CERT_IN_ACTIVE_CONFIG', 13);
+    }
+
+    const inbound = candidates[0].ib;
+    const certObj = getCertObj(inbound);
+    let certPem = '';
+    let keyPem = '';
+    let source = '';
+
+    if (hasFileRefCert(inbound)) {
+      source = 'file_refs';
+      const certFile = certObj.certificateFile.trim();
+      const keyFile = certObj.keyFile.trim();
+      try {
+        certPem = fs.readFileSync(certFile, 'utf8');
+        keyPem = fs.readFileSync(keyFile, 'utf8');
+      } catch (err) {
+        fail(`CERT_FILE_READ_ERROR:${err.message};CERT_FILE:${certFile};KEY_FILE:${keyFile}`, 14);
+      }
+    } else if (hasInlineCert(inbound)) {
+      source = 'inline_pem';
+      certPem = `${certObj.certificate.join('\n')}\n`;
+      keyPem = `${certObj.key.join('\n')}\n`;
+    } else {
+      fail(`NO_USABLE_CERT_DATA_FOR_TAG:${inbound?.tag || '<no-tag>'}`, 15);
+    }
+
+    fs.writeFileSync('/tmp/remnanode-selfsteal-fullchain.pem', certPem.endsWith('\n') ? certPem : `${certPem}\n`, { mode: 0o644 });
+    fs.writeFileSync('/tmp/remnanode-selfsteal-privkey.pem', keyPem.endsWith('\n') ? keyPem : `${keyPem}\n`, { mode: 0o600 });
+    fs.writeFileSync('/tmp/remnanode-selfsteal-source.txt', `tag=${inbound?.tag || '<no-tag>'};source=${source}\n`, { mode: 0o644 });
+  });
+}).on('error', (err) => {
+  fail(`REQUEST_ERROR:${err.message}`, 16);
+});
+NODE
+EOSH
+
+docker cp "\$REMNANODE_SERVICE_NAME:/tmp/remnanode-selfsteal-fullchain.pem" "\$tmp_dir/fullchain.pem" >/dev/null
+docker cp "\$REMNANODE_SERVICE_NAME:/tmp/remnanode-selfsteal-privkey.pem" "\$tmp_dir/privkey.pem" >/dev/null
+docker cp "\$REMNANODE_SERVICE_NAME:/tmp/remnanode-selfsteal-source.txt" "\$tmp_dir/source.txt" >/dev/null 2>&1 || true
+
+incoming_fp="\$(fingerprint "\$tmp_dir/fullchain.pem")" || die "incoming certificate is invalid"
+current_nginx_fp=""
+current_remnanode_fp=""
+if [[ -s "\$SELFSTEAL_NGINX_SSL_DIR/fullchain.crt" ]]; then
+  current_nginx_fp="\$(fingerprint "\$SELFSTEAL_NGINX_SSL_DIR/fullchain.crt" || true)"
+fi
+if [[ -s "\$REMNANODE_CERT_DIR/fullchain.pem" ]]; then
+  current_remnanode_fp="\$(fingerprint "\$REMNANODE_CERT_DIR/fullchain.pem" || true)"
+fi
+
+reload_nginx=0
+if [[ "\$incoming_fp" != "\$current_nginx_fp" ]]; then
+  reload_nginx=1
+fi
+
+if [[ -n "\$current_nginx_fp" && "\$incoming_fp" == "\$current_nginx_fp" && "\$incoming_fp" == "\$current_remnanode_fp" ]]; then
+  log "certificate unchanged: \$incoming_fp"
+  exit 0
+fi
+
+log "certificate sync needed: nginx=\${current_nginx_fp:-none}, remnanode=\${current_remnanode_fp:-none}, incoming=\$incoming_fp"
+if [[ -s "\$tmp_dir/source.txt" ]]; then
+  log "\$(cat "\$tmp_dir/source.txt")"
+fi
+
+stamp="\$(date -u +%Y%m%dT%H%M%SZ)"
+if [[ -d "\$SELFSTEAL_NGINX_SSL_DIR" ]]; then
+  cp -a "\$SELFSTEAL_NGINX_SSL_DIR" "\$SELFSTEAL_NGINX_SSL_DIR.backup.\$stamp"
+fi
+if [[ -d "\$REMNANODE_CERT_DIR" ]]; then
+  cp -a "\$REMNANODE_CERT_DIR" "\$REMNANODE_CERT_DIR.backup.\$stamp"
+fi
+
+mkdir -p "\$SELFSTEAL_NGINX_SSL_DIR" "\$REMNANODE_CERT_DIR"
+install -m 0644 "\$tmp_dir/fullchain.pem" "\$SELFSTEAL_NGINX_SSL_DIR/fullchain.crt"
+install -m 0600 "\$tmp_dir/privkey.pem" "\$SELFSTEAL_NGINX_SSL_DIR/private.key"
+install -m 0644 "\$tmp_dir/fullchain.pem" "\$REMNANODE_CERT_DIR/fullchain.pem"
+install -m 0600 "\$tmp_dir/privkey.pem" "\$REMNANODE_CERT_DIR/privkey.pem"
+ln -sfn "\$REMNANODE_CERT_DIR/privkey.pem" "\$REMNANODE_CERT_DIR/privkey.key"
+
+docker ps --format '{{.Names}}' | grep -qx "\$SELFSTEAL_NGINX_SERVICE_NAME" || die "container \$SELFSTEAL_NGINX_SERVICE_NAME is not running"
+docker exec "\$SELFSTEAL_NGINX_SERVICE_NAME" nginx -t
+if [[ "\$reload_nginx" == "1" ]]; then
+  docker exec "\$SELFSTEAL_NGINX_SERVICE_NAME" nginx -s reload
+  log "nginx reloaded with certificate: \$incoming_fp"
+else
+  log "nginx certificate already current; files synced without reload: \$incoming_fp"
+fi
+SYNC_SCRIPT
+
+  local esc_remnanode_service=""
+  local esc_selfsteal_service=""
+  local esc_base_domain=""
+  local esc_cert_helper_tag=""
+  local esc_cert_helper_tag_strict=""
+  local esc_cert_dir=""
+  local esc_nginx_ssl_dir=""
+
+  esc_remnanode_service="$(printf '%s' "$REMNANODE_SERVICE_NAME" | sed -e 's/[\\&|]/\\&/g')"
+  esc_selfsteal_service="$(printf '%s' "$SELFSTEAL_NGINX_SERVICE_NAME" | sed -e 's/[\\&|]/\\&/g')"
+  esc_base_domain="$(printf '%s' "$SELFSTEAL_BASE_DOMAIN" | sed -e 's/[\\&|]/\\&/g')"
+  esc_cert_helper_tag="$(printf '%s' "$CERT_HELPER_TAG" | sed -e 's/[\\&|]/\\&/g')"
+  esc_cert_helper_tag_strict="$(printf '%s' "$CERT_HELPER_TAG_STRICT" | sed -e 's/[\\&|]/\\&/g')"
+  esc_cert_dir="$(printf '%s' "$CERT_DIR" | sed -e 's/[\\&|]/\\&/g')"
+  esc_nginx_ssl_dir="$(printf '%s' "$SELFSTEAL_NGINX_SSL_DIR" | sed -e 's/[\\&|]/\\&/g')"
+
+  sed -i \
+    -e 's/\\\$/$/g' \
+    -e "s|__REMNANODE_SERVICE_NAME__|$esc_remnanode_service|g" \
+    -e "s|__SELFSTEAL_NGINX_SERVICE_NAME__|$esc_selfsteal_service|g" \
+    -e "s|__SELFSTEAL_BASE_DOMAIN__|$esc_base_domain|g" \
+    -e "s|__CERT_HELPER_TAG__|$esc_cert_helper_tag|g" \
+    -e "s|__CERT_HELPER_TAG_STRICT__|$esc_cert_helper_tag_strict|g" \
+    -e "s|__REMNANODE_CERT_DIR__|$esc_cert_dir|g" \
+    -e "s|__SELFSTEAL_NGINX_SSL_DIR__|$esc_nginx_ssl_dir|g" \
+    "$sync_script"
+
+  chmod 0755 "$sync_script"
+
+  cat > "$service_file" <<EOF2
+[Unit]
+Description=Sync selfsteal TLS certificate from RemnaNode active config
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$sync_script
+EOF2
+
+  cat > "$timer_file" <<EOF2
+[Unit]
+Description=Daily selfsteal TLS certificate sync
+
+[Timer]
+OnCalendar=${CERT_SYNC_ON_CALENDAR}
+RandomizedDelaySec=${CERT_SYNC_RANDOMIZED_DELAY_SECONDS}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF2
+
+  systemctl daemon-reload
+  if [[ "${CERT_SYNC_TIMER_ENABLED:-1}" == "1" ]]; then
+    systemctl enable --now remnanode-selfsteal-cert-sync.timer
+    ok "selfsteal cert sync timer enabled: ${CERT_SYNC_ON_CALENDAR} (+${CERT_SYNC_RANDOMIZED_DELAY_SECONDS}s random delay)"
+  else
+    systemctl disable --now remnanode-selfsteal-cert-sync.timer >/dev/null 2>&1 || true
+    ok "selfsteal cert sync script installed: $sync_script"
+  fi
+
+  if "$sync_script"; then
+    ok "selfsteal cert sync initial run completed"
+  else
+    warn "selfsteal cert sync initial run failed; check journalctl -u remnanode-selfsteal-cert-sync.service"
+  fi
+}
+
 install_selfsteal() {
   local domain="${SELFSTEAL_DOMAIN:-}"
   local template="${SELFSTEAL_TEMPLATE:-}"
@@ -1140,11 +1453,25 @@ main() {
     fi
 
     if install_selfsteal; then
+      install_selfsteal_cert_sync
       STATUS_SELFSTEAL="OK"
-      NOTE_SELFSTEAL="installed and checked"
+      NOTE_SELFSTEAL="installed, checked, cert sync timer enabled"
     else
       STATUS_SELFSTEAL="FAIL"
       NOTE_SELFSTEAL="installation failed"
+      exit 2
+    fi
+  fi
+
+  if [[ "$RUN_CERT_SYNC" -eq 1 ]]; then
+    need_cmd docker
+    STATUS_SELFSTEAL="IN_PROGRESS"
+    if install_selfsteal_cert_sync; then
+      STATUS_SELFSTEAL="OK"
+      NOTE_SELFSTEAL="cert sync timer enabled"
+    else
+      STATUS_SELFSTEAL="FAIL"
+      NOTE_SELFSTEAL="cert sync timer setup failed"
       exit 2
     fi
   fi
